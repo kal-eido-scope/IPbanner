@@ -35,10 +35,12 @@ python ipbanner.py -t
 
 2. renewPolicy的模式是删除旧的名为ip blacklist的策略，并根据suspiciousIPs文件中的ip列表重新生成一个新的名为ip blacklist的策略，不会保留原有策略。
 
-3. 如果运行失败，请在ipbanner.py的第128行请自行修改evtx文件的位置，位置查看方法：
+3. 若运行失败，请尝试在ipbanner.py的第187行请自行修改evtx文件的位置，位置查看方法：
     * win+R, eventvwr.msc调出事件查看器
     * 应用程序和服务日志 - Microsoft - Windows - RemoteDesktopServices-RdpCoreTS - Operational
     * 右侧列表属性 - 日志路径
+
+4. 更新了从缓存读取事件功能，省去每次必须手动重启Windows EventLog以将缓存写入日志文件再进行读取的麻烦。
 
 ### Data contenet
 
