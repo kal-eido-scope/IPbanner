@@ -8,6 +8,7 @@ import logging
 import argparse
 import subprocess
 import tempfile
+import ipaddress
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,36 +42,51 @@ def read_eventlog_from_cache(
     logName: str = "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational"
 ) -> list:
     """获取事件查看器中logName服务的缓存内容，返回事件列表"""
-    temp_evtx = tempfile.mktemp(suffix='.evtx')
+    # 使用安全的临时文件创建方法
+    tmp = None
     try:
-
         logging.info('Reading the evtx from cache.')
+        with tempfile.NamedTemporaryFile(suffix='.evtx', delete=False) as tmpf:
+            temp_evtx = tmpf.name
+
         # 导出缓存中的完整日志到临时文件
         export_cmd = [
             'wevtutil', 'epl', logName, temp_evtx,
-            '/ow:true', 
+            '/ow:true',
         ]
-        
-        result = subprocess.run(export_cmd, capture_output=True, text=True , encoding='utf-8')
-        
+
+        result = subprocess.run(export_cmd, capture_output=True, text=True, encoding='utf-8')
+
         if result.returncode != 0:
-            logging.error(f"Error happenned when getting the cache: {str(e)}")
+            logging.error(f"Error happened when getting the cache: {result.returncode} {result.stderr}")
+            return []
 
         return evtx_to_list(temp_evtx)
-        
+
     except Exception as e:
-        logging.error(f"Error happenned when reading the cache: {str(e)}")
+        logging.error(f"Error happened when reading the cache: {str(e)}")
+        return []
 
     finally:
         # 清理临时文件
-        if os.path.exists(temp_evtx):
-            try:
+        try:
+            if 'temp_evtx' in locals() and os.path.exists(temp_evtx):
                 os.remove(temp_evtx)
-            except:
-                pass
+        except Exception:
+            pass
+
+def is_valid_ip(ip_str: str) -> bool:
+    """验证字符串是否为合法 IPv4 或 IPv6 地址（忽略空字符串）。"""
+    if not ip_str:
+        return False
+    try:
+        ipaddress.ip_address(ip_str)
+        return True
+    except Exception:
+        return False
 
 def read_eventlog_from_file(
-        baseDir: str = 'C:\Windows\System32\winevt\Logs',
+    baseDir: str = r'C:\Windows\System32\winevt\Logs',
         logName: str = "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational"
     )->list:
     """获取事件查看器中logName服务的本地日志文件内容，返回事件列表"""
@@ -87,11 +103,23 @@ def merge_event_list(*eventLists):
     seen = set()
     result = []
     for item in allList:
-        if isinstance(item,dict):
-            uniqueId = item['Event']['System']['EventRecordID']
-        if uniqueId not in seen:
-            seen.add(uniqueId)
-            result.append(item)
+        try:
+            if not isinstance(item, dict):
+                continue
+            evrec = item.get('Event', {}).get('System', {}).get('EventRecordID')
+            if evrec is None:
+                continue
+            # EventRecordID 有时为 dict 包含 '#text'
+            if isinstance(evrec, dict):
+                uniqueId = evrec.get('#text')
+            else:
+                uniqueId = str(evrec)
+
+            if uniqueId not in seen:
+                seen.add(uniqueId)
+                result.append(item)
+        except Exception:
+            continue
     return result
 
 def find_rdp140_events(eventList:list)->dict:
@@ -99,36 +127,73 @@ def find_rdp140_events(eventList:list)->dict:
     ipCounts = {}
     logging.info('Filter out the login failure attempts.')
     for i,event in enumerate(eventList):
-        if event['Event']['System']['EventID']['#text'] == '140':
-            ip = event['Event']['EventData']['Data']['#text']
-            ipCounts[ip] = ipCounts.get(ip,0) + 1
+        try:
+            event_id = event.get('Event', {}).get('System', {}).get('EventID')
+            if isinstance(event_id, dict):
+                event_id_text = event_id.get('#text')
+            else:
+                event_id_text = str(event_id)
+
+            if event_id_text == '140':
+                data = event.get('Event', {}).get('EventData', {}).get('Data')
+                # Data 可能为 dict 或 list
+                ip = None
+                if isinstance(data, dict):
+                    ip = data.get('#text') or next(iter(data.values()), None)
+                elif isinstance(data, list):
+                    # 尝试从第一个元素获取
+                    first = data[0] if data else None
+                    if isinstance(first, dict):
+                        ip = first.get('#text') or next(iter(first.values()), None)
+                    else:
+                        ip = first
+
+                if ip:
+                    ipCounts[ip] = ipCounts.get(ip, 0) + 1
+        except Exception:
+            continue
     return ipCounts
 
-def sortedIp(ipList:dict)->list:
-    """将ipCounts字典按ip地址顺序及小到大排列"""
-    return sorted(ipList, key = lambda x : (int(x.split('.')[0]),int(x.split('.')[1]),int(x.split('.')[2]),int(x.split('.')[3])))
+def sortedIp(ipList:list)->list:
+    """将ip地址列表按从小到大排序（按 IPv4 各段）"""
+    def ip_key(x):
+        try:
+            parts = x.split('.')
+            return tuple(int(p) for p in parts)
+        except Exception:
+            return (999,999,999,999)
+    return sorted(ipList, key=ip_key)
 
-def write_data(*eventList,ipCounts:dict):
+def write_data(eventList:list, ipCounts:dict):
     """写入文件至本地"""
-    logging.info('Writing data to the data\ folder.')
+    logging.info('Writing data to the data folder.')
     # 创建目录
-    os.makedirs('data',exist_ok=True)
+    os.makedirs('data', exist_ok=True)
     curTime = time.localtime(time.time())
-    formatedTime = '%04d-%02d-%02d-%02d-%02d-%02d'%(curTime.tm_year,curTime.tm_mon,curTime.tm_mday,curTime.tm_hour,curTime.tm_min,curTime.tm_sec)
-    updateDir = os.path.join('data',formatedTime)
-    os.makedirs(updateDir,exist_ok=True)
+    formatedTime = '%04d-%02d-%02d-%02d-%02d-%02d' % (
+        curTime.tm_year,
+        curTime.tm_mon,
+        curTime.tm_mday,
+        curTime.tm_hour,
+        curTime.tm_min,
+        curTime.tm_sec,
+    )
+    updateDir = os.path.join('data', formatedTime)
+    os.makedirs(updateDir, exist_ok=True)
 
     # 输出json格式的eventlist日志文件
-    for i,item in enumerate(eventList):
-        eventListPath = os.path.join(updateDir,f'eventList{i}.json')
-        with open(eventListPath,'w',newline='\n')as f:
-            json.dump(item,f,indent=4)
+    eventListPath = os.path.join(updateDir, 'eventList.json')
+    try:
+        with open(eventListPath, 'w', newline='\n', encoding='utf-8') as f:
+            json.dump(eventList, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f'Failed to write eventList.json: {e}')
 
     # 输出访问失败的ip相应次数
-    sortedIpCounts = dict(sorted(ipCounts.items(),key = lambda x:x[1],reverse=True))
-    ipCountsPath = os.path.join(updateDir,'ipCounts.txt')
-    with open (ipCountsPath,'w',encoding='utf-8') as f:
-        for ip,counts in sortedIpCounts.items():
+    sortedIpCounts = dict(sorted(ipCounts.items(), key=lambda x: x[1], reverse=True))
+    ipCountsPath = os.path.join(updateDir, 'ipCounts.txt')
+    with open(ipCountsPath, 'w', encoding='utf-8') as f:
+        for ip, counts in sortedIpCounts.items():
             f.write(f'{ip}\t{counts}次\n')
 
 def update_bannedIP(ipCounts:dict):
@@ -136,28 +201,45 @@ def update_bannedIP(ipCounts:dict):
     logging.info('Updating the suspicious IP addresses.')
     if not os.path.exists('suspiciousIPs.txt'):
         # 初始化文件
-        with open ('suspiciousIPs.txt','w',encoding='utf-8') as f:
-            for ip in sortedIp(list(ipCounts.keys())):
+        with open('suspiciousIPs.txt', 'w', encoding='utf-8') as f:
+            valid_ips = [ip.strip() for ip in list(ipCounts.keys()) if is_valid_ip(ip.strip())]
+            for ip in sortedIp(valid_ips):
                 f.write(f'{ip}\n')
     else:
         # 去重合并，从小到大排列
-        with open ('suspiciousIPs.txt','r',encoding='utf-8') as f:
-            preIpList = f.read().strip().splitlines()    
-            newIpList = sortedIp(list(set(preIpList+list(ipCounts.keys()))))
+        with open('suspiciousIPs.txt', 'r', encoding='utf-8') as f:
+            preIpList = [line.strip() for line in f.read().splitlines() if line.strip()]
+            pre_valid = [ip for ip in preIpList if is_valid_ip(ip)]
+            new_candidates = [ip.strip() for ip in list(ipCounts.keys()) if is_valid_ip(ip.strip())]
+            newIpList = sortedIp(list(set(pre_valid + new_candidates)))
         # 写入新文件    
-        with open ('suspiciousIPs.txt','w',encoding='utf-8') as f:
+        with open('suspiciousIPs.txt', 'w', encoding='utf-8') as f:
             for ip in newIpList:
                 f.write(f'{ip}\n')
 
 def write_command():
     """输出批量禁止的批处理文件"""
     bannedIpList = []
+    invalid_lines = []
     try:
         logging.info('Generating renewPolicy.bat from suspiciousIPs.txt.')
-        with open('suspiciousIPs.txt','r',encoding='utf-8') as f:
+        with open('suspiciousIPs.txt', 'r', encoding='utf-8') as f:
             for line in f:
-                bannedIpList.append(line.strip())
-        with open('renewPolicy.bat','w',encoding='utf-8',newline='\n') as f:
+                s = line.strip()
+                if not s:
+                    continue
+                if is_valid_ip(s):
+                    bannedIpList.append(s)
+                else:
+                    invalid_lines.append(s)
+
+        if invalid_lines:
+            logging.warning('Found invalid IP lines in suspiciousIPs.txt (ignored): %s', ', '.join(invalid_lines))
+
+        # 去重并排序
+        bannedIpList = sortedIp(list(dict.fromkeys(bannedIpList)))
+
+        with open('renewPolicy.bat', 'w', encoding='utf-8', newline='\n') as f:
             # 删除旧策略
             f.write('netsh ipsec static delete policy name="ip blacklist"\n')
             # 创建新策略    ip blacklist
@@ -167,15 +249,17 @@ def write_command():
             # 创建新筛选器列表  banned IP
             f.write('netsh ipsec static add filterlist name="banned IP"\n')
             # 在筛选器中添加ip限制
-            f.writelines([f'netsh ipsec static add filter filterlist="banned IP" srcaddr={ip} dstaddr=me protocol=any mirror=no\n' for ip in bannedIpList])
+            for ip in bannedIpList:
+                f.write(f'netsh ipsec static add filter filterlist="banned IP" srcaddr={ip} dstaddr=me protocol=any mirror=no\n')
             # 将筛选器关联到策略 restrictions from rdp
             f.write('netsh ipsec static add rule name="rdp restrictions" policy="ip blacklist" filterlist="banned IP" filteraction="block"\n')
             # 指派筛选器生效
             f.write('netsh ipsec static set policy name="ip blacklist" assign=yes\n')
             f.write('pause')
+    except FileNotFoundError:
+        logging.error('suspiciousIPs.txt not found. Please run the script with -d to generate or create the file.')
     except Exception as e:
-        logging.error('Error happened when openning suspiciousIPs.txt')
-        logging.error(e)
+        logging.error('Error happened when opening suspiciousIPs.txt: %s', e)
 
 def main():
     args = parse_args()
@@ -184,14 +268,14 @@ def main():
         # 只根据根目录的suspiciousIPs.txt生成bat文件
         write_command()
     else:
-        logDir = 'C:\Windows\System32\winevt\Logs'             # 此行请根据自己的情况相应填写事件查看器中rdp.evtx所在的绝对路径
+        logDir = r'C:\Windows\System32\winevt\Logs'             # 此行请根据自己的情况相应填写事件查看器中rdp.evtx所在的绝对路径
         rdpLogName = 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'
         rdpEventListFromFile = read_eventlog_from_file(logDir,rdpLogName)
         rdpEventListFromCache = read_eventlog_from_cache(rdpLogName)
         rdpEventList = merge_event_list(rdpEventListFromFile,rdpEventListFromCache)
         ipCounts = find_rdp140_events(rdpEventList)
         if data_flag:
-            write_data(rdpEventList,ipCounts=ipCounts)
+            write_data(rdpEventList, ipCounts)
         update_bannedIP(ipCounts)
         if command_flag:
             write_command()
